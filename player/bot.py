@@ -20,6 +20,7 @@ IMPORTS YOU MIGHT NEED:
 """
 from __future__ import annotations
 from typing import Optional, List, Dict, Any, Tuple
+from concurrent.futures import ThreadPoolExecutor, Future
 import os
 import math
 
@@ -74,6 +75,12 @@ class Bot:
         self._target_config: Optional[Tuple[int, int]] = None  # (target_x, target_rot_idx)
         self._model = None
         self._use_model = False
+        # Async planning executor to avoid blocking decide()
+        try:
+            self._executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(max_workers=1)
+        except Exception:
+            self._executor = None
+        self._pending_future: Optional[Future] = None
 
         # Try to initialize a small policy network matching the GA-style model
         # Input: 4 features [lines_cleared, holes, bumpiness, height] -> 1 score
@@ -357,23 +364,43 @@ class Bot:
         self._last_y = p_y
 
         if is_switch:
-            # Leaky-bucket: mark switch this turn, compute once, then turn off
+            # Mark switch and clear existing plan
             self._switch_this_turn = True
             self._action_plan.clear()
             self._target_config = None
-
-            # Plan from a board without the current falling piece to avoid self-collision
             clean_grid = self._strip_current_from_grid(grid, current_piece)
-            plan, target = self._plan_actions_for_piece(clean_grid, current_piece)
-            self._action_plan = plan[:]
-            self._target_config = target
-            # turn off after this compute
+            # Launch background planning (append when done)
+            try:
+                self._pending_future = self._executor.submit(self._plan_actions_for_piece, clean_grid, current_piece)
+            except Exception:
+                self._pending_future = None
             self._switch_this_turn = False
 
-        # Follow previously planned path verbatim (no re-planning)
+        # If a background plan finished, append its actions
+        if self._pending_future is not None and self._pending_future.done():
+            try:
+                plan, target = self._pending_future.result()
+                self._action_plan.extend(plan)
+                self._target_config = target
+            except Exception:
+                pass
+            finally:
+                self._pending_future = None
+
+        # If no plan and no compute running, start one now
+        if not self._action_plan and self._pending_future is None and current_piece is not None:
+            try:
+                clean_grid = self._strip_current_from_grid(grid, current_piece)
+                self._pending_future = self._executor.submit(self._plan_actions_for_piece, clean_grid, current_piece)
+            except Exception:
+                self._pending_future = None
+
+        # Emit next planned action if available
         if self._action_plan:
             return self._action_plan.pop(0)
-        return None
+
+        # Fallback while waiting: soft drop to keep active
+        return "s"
 
     # ------------------------------
     # Planning and scoring utilities
