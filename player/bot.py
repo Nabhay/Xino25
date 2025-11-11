@@ -19,7 +19,16 @@ IMPORTS YOU MIGHT NEED:
 -----------------------
 """
 from __future__ import annotations
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
+import os
+import math
+
+try:
+    import torch
+    import torch.nn as nn
+except Exception:  # Torch optional; we'll fallback to heuristics if unavailable
+    torch = None  # type: ignore
+    nn = None  # type: ignore
 
 # Add your imports here (numpy, tensorflow, pytorch, etc.)
 # import numpy as np
@@ -56,7 +65,54 @@ class Bot:
         # self.move_history = []
         # self.strategy = "aggressive"
         """
-        pass  # Replace with your initialization code
+        # Runtime plan: queue of actions to emit across decide() calls
+        self._action_plan: List[str] = []
+        # Leaky-bucket control: only plan once per new piece spawn
+        self._switch_this_turn: bool = False
+        self._active_piece_type: Optional[str] = None
+        self._last_y: Optional[int] = None
+        self._target_config: Optional[Tuple[int, int]] = None  # (target_x, target_rot_idx)
+        self._model = None
+        self._use_model = False
+
+        # Try to initialize a small policy network matching the GA-style model
+        # Input: 4 features [lines_cleared, holes, bumpiness, height] -> 1 score
+        # Hidden sizes chosen to match typical GA defaults
+        if torch is not None:
+            class PolicyNetwork(nn.Module):
+                def __init__(self, in_features: int = 4, h1: int = 32, h2: int = 32) -> None:
+                    super().__init__()
+                    self.fc1 = nn.Linear(in_features, h1)
+                    self.fc2 = nn.Linear(h1, h2)
+                    self.out = nn.Linear(h2, 1)
+
+                def forward(self, x):  # x: [N,4]
+                    x = torch.relu(self.fc1(x))
+                    x = torch.relu(self.fc2(x))
+                    x = self.out(x)
+                    return x.view(-1)
+
+            self._model = PolicyNetwork()
+
+            # Candidate model paths (first existing will be loaded)
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            candidates = [
+                os.path.join(os.path.dirname(__file__), "model.pth"),
+                os.path.join(repo_root, "AML-Tetris-Reinforcement-Learning", "models", "genetic_score_1845942.pth"),
+            ]
+            model_path = next((p for p in candidates if os.path.exists(p)), None)
+            if model_path:
+                try:
+                    state = torch.load(model_path, map_location="cpu")
+                    if isinstance(state, dict) and any(k.startswith("module.") for k in state.keys()):
+                        state = {k.replace("module.", "", 1): v for k, v in state.items()}
+                    self._model.load_state_dict(state, strict=False)
+                    self._model.eval()
+                    self._use_model = True
+                except Exception:
+                    # If load fails, we'll use heuristic fallback
+                    self._use_model = False
+        # If torch wasn't importable, we will use heuristic scoring
 
     def decide(self, obs: Optional[dict]) -> Optional[str]:
         """
@@ -273,15 +329,232 @@ class Bot:
         # ================================================================
         
         # Extract game state components
-        grid = obs["grid"]                    # 20x10 board
-        current_piece = obs["current_piece"]  # Currently falling piece
-        next_piece = obs["next_piece"]        # Next piece coming
-        level = obs["level"]                  # Current difficulty
-        
-        # TODO: Add your decision logic here
-        # Example: return 'a' to move left, 'd' to move right, etc.
-        
-        return None  # Replace with your logic
+        grid: List[List[int]] = obs.get("grid")  # rows x cols, 0 empty, >0 filled
+        current_piece: Optional[Dict[str, Any]] = obs.get("current_piece")
+        # next_piece and level are available but not required for single-move planning
+
+        # If no active piece, clear plan and wait
+        if not current_piece:
+            self._action_plan.clear()
+            self._target_config = None
+            return None
+
+        p_type = str(current_piece.get("type"))
+        p_y = int(current_piece.get("y", 0))
+
+        # Detect switch: new piece type or spawn reset upward
+        is_switch = False
+        if self._active_piece_type is None:
+            is_switch = True
+        elif p_type != self._active_piece_type:
+            is_switch = True
+        elif self._last_y is not None and (p_y < self._last_y - 3 or (p_y <= 1 and self._last_y > 1)):
+            # Jump upwards or appeared at top -> new piece spawned
+            is_switch = True
+
+        # Update last seen for next call
+        self._active_piece_type = p_type
+        self._last_y = p_y
+
+        if is_switch:
+            # Leaky-bucket: mark switch this turn, compute once, then turn off
+            self._switch_this_turn = True
+            self._action_plan.clear()
+            self._target_config = None
+
+            # Plan from a board without the current falling piece to avoid self-collision
+            clean_grid = self._strip_current_from_grid(grid, current_piece)
+            plan, target = self._plan_actions_for_piece(clean_grid, current_piece)
+            self._action_plan = plan[:]
+            self._target_config = target
+            # turn off after this compute
+            self._switch_this_turn = False
+
+        # Follow previously planned path verbatim (no re-planning)
+        if self._action_plan:
+            return self._action_plan.pop(0)
+        return None
+
+    # ------------------------------
+    # Planning and scoring utilities
+    # ------------------------------
+    def _plan_actions_for_piece(self, grid: List[List[int]], piece: Dict[str, Any]) -> Tuple[List[str], Tuple[int, int]]:
+        rows = len(grid)
+        cols = len(grid[0]) if rows > 0 else 10
+
+        # Enumerate all feasible placements (rotation, x) for the current piece
+        piece_type: str = str(piece.get("type"))
+        cur_x: int = int(piece.get("x", 0))
+        cur_y: int = int(piece.get("y", 0))
+        cur_rot: int = int(piece.get("rotation", 0))
+
+        rotations = self._get_rotations_for_type(piece_type)
+        features_batch: List[List[float]] = []
+        placements_meta: List[Tuple[int, int, int, int]] = []  # (x, final_y, rot_index, width)
+
+        for r_idx, cells in enumerate(rotations):
+            min_col, max_col = self._piece_minmax_cols(cells)
+            width = max_col - min_col + 1
+
+            # Valid x so that piece within [0, cols-1]
+            min_x = -min_col
+            max_x = cols - width
+            for x in range(min_x, max_x + 1):
+                # Start from current y; if immediate collision at current y, skip this placement
+                y = cur_y
+                if self._collides(grid, cells, x, y):
+                    continue
+                # Drop until collision
+                while not self._collides(grid, cells, x, y + 1):
+                    y += 1
+
+                # Place piece and compute resulting board and features
+                placed = self._place_on_board(grid, cells, x, y)
+                lines_cleared, board_after = self._clear_full_rows(placed)
+                holes = self._count_holes(board_after)
+                bumpiness, height = self._bumpiness_and_total_height(board_after)
+                features = [float(lines_cleared), float(holes), float(bumpiness), float(height)]
+
+                features_batch.append(features)
+                placements_meta.append((x, y, r_idx, width))
+
+        # If no placements found (should be rare), do a hard drop as a fallback
+        if not features_batch:
+            return [" "], (cur_x, cur_rot)
+
+        # Score placements: prefer model if available, else heuristic
+        if self._use_model and torch is not None:
+            with torch.no_grad():
+                x_in = torch.tensor(features_batch, dtype=torch.float32)
+                try:
+                    scores_t = self._model(x_in)  # type: ignore[arg-type]
+                    scores = scores_t.detach().cpu().tolist()
+                except Exception:
+                    scores = [self._heuristic_score(f) for f in features_batch]
+        else:
+            scores = [self._heuristic_score(f) for f in features_batch]
+
+        # Choose the argmax score
+        best_idx = max(range(len(scores)), key=lambda i: scores[i])
+        target_x, _, target_rot_idx, _ = placements_meta[best_idx]
+
+        # Build action plan: rotate -> horizontal move -> hard drop
+        nR = len(rotations)
+        rot_delta = (target_rot_idx - cur_rot) % nR
+        actions: List[str] = []
+        actions += ["w"] * rot_delta
+
+        if target_x < cur_x:
+            actions += ["a"] * (cur_x - target_x)
+        elif target_x > cur_x:
+            actions += ["d"] * (target_x - cur_x)
+
+        # Hard drop
+        actions.append(" ")
+        return actions, (target_x, target_rot_idx)
+
+    def _heuristic_score(self, f: List[float]) -> float:
+        # Weighted sum heuristic if no model: reward lines, penalize holes, bumpiness, height
+        lines, holes, bumpiness, height = f
+        return 5.0 * lines - 1.5 * holes - 0.5 * bumpiness - 0.05 * height
+
+    # ---------------
+    # Piece utilities
+    # ---------------
+    def _get_rotations_for_type(self, piece_type: str) -> List[List[Tuple[int, int]]]:
+        """Return list of rotations as lists of (i,j) cell coordinates in 4x4 frame."""
+        # Mirrors tetris.shape.version definitions
+        version = {
+            "I": [[1, 5, 9, 13], [4, 5, 6, 7]],
+            "Z": [[4, 5, 9, 10], [2, 6, 5, 9]],
+            "S": [[6, 7, 9, 10], [1, 5, 6, 10]],
+            "L": [[1, 2, 5, 9], [0, 4, 5, 6], [1, 5, 9, 8], [4, 5, 6, 10]],
+            "J": [[1, 2, 6, 10], [5, 6, 7, 9], [2, 6, 10, 11], [3, 5, 6, 7]],
+            "T": [[1, 4, 5, 6], [1, 4, 5, 9], [4, 5, 6, 9], [1, 5, 6, 9]],
+            "O": [[1, 2, 5, 6]],
+        }
+        idx_lists = version.get(piece_type, version["O"])  # default to O if unknown
+        rotations: List[List[Tuple[int, int]]] = []
+        for lst in idx_lists:
+            coords = [(p // 4, p % 4) for p in lst]
+            rotations.append(coords)
+        return rotations
+
+    def _piece_minmax_cols(self, cells: List[Tuple[int, int]]) -> Tuple[int, int]:
+        cols = [c for (_, c) in cells]
+        return (min(cols), max(cols))
+
+    def _collides(self, board: List[List[int]], cells: List[Tuple[int, int]], x: int, y: int) -> bool:
+        rows = len(board)
+        cols = len(board[0]) if rows > 0 else 10
+        for (i, j) in cells:
+            br = y + i
+            bc = x + j
+            if br >= rows or bc < 0 or bc >= cols:
+                return True
+            if br >= 0 and board[br][bc] > 0:
+                return True
+        return False
+
+    def _place_on_board(self, board: List[List[int]], cells: List[Tuple[int, int]], x: int, y: int) -> List[List[int]]:
+        placed = [row[:] for row in board]
+        for (i, j) in cells:
+            br = y + i
+            bc = x + j
+            if 0 <= br < len(placed) and 0 <= bc < len(placed[0]):
+                placed[br][bc] = 1  # treat as filled; color not needed for features
+        return placed
+
+    def _clear_full_rows(self, board: List[List[int]]) -> Tuple[int, List[List[int]]]:
+        rows = len(board)
+        cols = len(board[0]) if rows > 0 else 10
+        keep = []
+        cleared = 0
+        for r in range(rows):
+            if all(board[r][c] > 0 for c in range(cols)):
+                cleared += 1
+            else:
+                keep.append(board[r][:])
+        # Add empty rows at top for each cleared
+        new_board = [[0 for _ in range(cols)] for _ in range(cleared)] + keep
+        return cleared, new_board
+
+    def _count_holes(self, board: List[List[int]]) -> int:
+        rows = len(board)
+        cols = len(board[0]) if rows > 0 else 10
+        holes = 0
+        for c in range(cols):
+            seen_block = False
+            for r in range(rows):
+                if board[r][c] > 0:
+                    seen_block = True
+                elif seen_block and board[r][c] == 0:
+                    holes += 1
+        return holes
+
+    def _bumpiness_and_total_height(self, board: List[List[int]]) -> Tuple[int, int]:
+        rows = len(board)
+        cols = len(board[0]) if rows > 0 else 10
+        heights: List[int] = []
+        for c in range(cols):
+            h = 0
+            for r in range(rows):
+                if board[r][c] > 0:
+                    h = rows - r
+                    break
+            heights.append(h)
+        bump = sum(abs(heights[i] - heights[i + 1]) for i in range(cols - 1))
+        total_h = sum(heights)
+        return bump, total_h
+
+    def _strip_current_from_grid(self, grid: List[List[int]], piece: Dict[str, Any]) -> List[List[int]]:
+        """Return a copy of grid with the current piece cells removed (set to 0)."""
+        g = [row[:] for row in grid]
+        cells = piece.get("cells") or []
+        for (r, c) in cells:
+            if 0 <= r < len(g) and 0 <= c < len(g[0]):
+                g[r][c] = 0
+        return g
         
         # ================================================================
         # END OF YOUR IMPLEMENTATION

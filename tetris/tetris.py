@@ -2,6 +2,13 @@ import pygame
 import random
 import sys
 import os
+
+# Ensure project root is on sys.path so `from player.player import Grid` works when
+# this script is executed directly (e.g. `python tetris/tetris.py`). Without
+# this, Python may not resolve the `player` package when the current working
+# directory differs from the repository root.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from player.player import Grid
 
 pygame.init()
