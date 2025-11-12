@@ -465,18 +465,25 @@ class Bot:
         best_idx = max(range(len(scores)), key=lambda i: scores[i])
         target_x, _, target_rot_idx, _ = placements_meta[best_idx]
 
-        # Build action plan: rotate -> horizontal move -> hard drop
+        # Build action plan: horizontal move -> rotate -> hard drop
+        # Moving to the final frame-origin first then rotating ensures the
+        # piece's 4x4 anchor matches the planned placement. Rotating first
+        # can change the visible anchor for some shapes and cause off-by-one
+        # placement errors.
         nR = len(rotations)
         rot_delta = (target_rot_idx - cur_rot) % nR
         actions: List[str] = []
-        actions += ["w"] * rot_delta
 
+        # Horizontal moves first (bring the frame origin to target_x)
         if target_x < cur_x:
             actions += ["a"] * (cur_x - target_x)
         elif target_x > cur_x:
             actions += ["d"] * (target_x - cur_x)
 
-        # Hard drop
+        # Then apply rotation(s)
+        actions += ["w"] * rot_delta
+
+        # Finally hard drop
         actions.append(" ")
         return actions, (target_x, target_rot_idx)
 
