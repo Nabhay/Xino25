@@ -427,9 +427,33 @@ class Bot:
             min_x = -min_col
             max_x = cols - width
             for x in range(min_x, max_x + 1):
-                # Start from current y; if immediate collision at current y, skip this placement
+                # Start from current y; if immediate collision at current y for the
+                # rotated shape, skip this placement. This also prevents placements
+                # that only work by "sliding" the piece into a gap where the
+                # rotated shape overlaps while moving.
                 y = cur_y
                 if self._collides(grid, cells, x, y):
+                    continue
+
+                # Ensure horizontal path from current x to target x is clear
+                # when the piece is in its current rotation. If the bot would
+                # need to "slide" (i.e., move through positions where the
+                # piece in current rotation collides), then skip this
+                # placement.
+                path_clear = True
+                if x != cur_x:
+                    step = 1 if x > cur_x else -1
+                    # iterate through each step from cur_x towards x
+                    xi = cur_x
+                    while xi != x:
+                        xi += step
+                        # If the piece in its current rotation would collide at
+                        # this intermediate x at the spawn y, the move is not
+                        # possible without sliding in.
+                        if self._collides(grid, rotations[cur_rot], xi, cur_y):
+                            path_clear = False
+                            break
+                if not path_clear:
                     continue
                 # Drop until collision
                 while not self._collides(grid, cells, x, y + 1):
@@ -461,31 +485,90 @@ class Bot:
         else:
             scores = [self._heuristic_score(f) for f in features_batch]
 
-        # Choose the argmax score
-        best_idx = max(range(len(scores)), key=lambda i: scores[i])
-        target_x, _, target_rot_idx, _ = placements_meta[best_idx]
-
-        # Build action plan: horizontal move -> rotate -> hard drop
-        # Moving to the final frame-origin first then rotating ensures the
-        # piece's 4x4 anchor matches the planned placement. Rotating first
-        # can change the visible anchor for some shapes and cause off-by-one
-        # placement errors.
+        # Try placements in score-descending order but validate that the
+        # sequence of actions to reach the placement will actually execute
+        # in the game (no rotation or move will be rejected). If a rotation
+        # would collide we attempt small horizontal kicks (left/right up to
+        # 2 cells) by inserting moves before the rotation. If we cannot make
+        # the rotation succeed, skip this placement.
         nR = len(rotations)
-        rot_delta = (target_rot_idx - cur_rot) % nR
-        actions: List[str] = []
+        order = sorted(range(len(scores)), key=lambda i: -scores[i])
 
-        # Horizontal moves first (bring the frame origin to target_x)
-        if target_x < cur_x:
-            actions += ["a"] * (cur_x - target_x)
-        elif target_x > cur_x:
-            actions += ["d"] * (target_x - cur_x)
+        def validate_and_build(x_target: int, rot_target: int) -> Optional[List[str]]:
+            # initial virtual state
+            vx = cur_x
+            vy = cur_y
+            vrot = cur_rot
+            plan: List[str] = []
 
-        # Then apply rotation(s)
-        actions += ["w"] * rot_delta
+            # horizontal moves to bring frame origin to target x
+            if x_target < vx:
+                moves = ["a"] * (vx - x_target)
+            else:
+                moves = ["d"] * (x_target - vx)
 
-        # Finally hard drop
-        actions.append(" ")
-        return actions, (target_x, target_rot_idx)
+            # apply horizontal moves step-by-step, ensuring none are blocked
+            for m in moves:
+                dx = -1 if m == "a" else 1
+                if self._collides(grid, rotations[vrot], vx + dx, vy):
+                    return None
+                vx += dx
+                plan.append(m)
+
+            # compute how many rotations needed
+            rot_steps = (rot_target - vrot) % nR
+            for _ in range(rot_steps):
+                next_rot = (vrot + 1) % nR
+                # if rotating in-place is possible, do it
+                if not self._collides(grid, rotations[next_rot], vx, vy):
+                    plan.append("w")
+                    vrot = next_rot
+                    continue
+
+                # otherwise try small kicks (left/right up to 2 cells)
+                kicked = False
+                for kick in ( -1, 1, -2, 2 ):
+                    # check path to kick position is clear in current rotation
+                    step = 1 if kick > 0 else -1
+                    ok = True
+                    tx = vx
+                    for _ in range(abs(kick)):
+                        tx += step
+                        if self._collides(grid, rotations[vrot], tx, vy):
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+
+                    # now check rotation at kicked x succeeds
+                    if not self._collides(grid, rotations[next_rot], vx + kick, vy):
+                        # insert the horizontal moves to perform the kick
+                        if kick > 0:
+                            plan.extend(["d"] * kick)
+                        else:
+                            plan.extend(["a"] * (-kick))
+                        vx += kick
+                        plan.append("w")
+                        vrot = next_rot
+                        kicked = True
+                        break
+
+                if not kicked:
+                    # cannot rotate into this orientation at this x/vy
+                    return None
+
+            # finally hard drop
+            plan.append(" ")
+            return plan
+
+        for idx in order:
+            tx, _, trot, _ = placements_meta[idx]
+            plan = validate_and_build(tx, trot)
+            if plan is not None:
+                return plan, (tx, trot)
+
+        # No valid placement found that can be executed safely; fallback
+        return [" "], (cur_x, cur_rot)
 
     def _heuristic_score(self, f: List[float]) -> float:
         # Weighted sum heuristic if no model: reward lines, penalize holes, bumpiness, height
